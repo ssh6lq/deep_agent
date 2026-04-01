@@ -29,6 +29,7 @@ load_dotenv(_APP_DIR / ".env")
 from langchain.chat_models import init_chat_model
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from deepagents import create_deep_agent
+from deepagents.backends.filesystem import FilesystemBackend
 
 # ── 내부 모듈 ──────────────────────────────────────────────────────
 from tools import custom_tools
@@ -156,17 +157,75 @@ def build_rag_tools(file_paths: list[str]) -> list:
 #  스트리밍 출력 핸들러
 # ══════════════════════════════════════════════════════════════════
 
-async def stream_agent(agent, query: str) -> None:
-    """deepagents CompiledStateGraph를 스트리밍으로 실행하고 출력한다."""
+def _box(label: str, text: str, width: int = 80) -> None:
+    """텍스트를 박스 형태로 출력한다."""
+    border = "─" * width
+    print(f"\n┌{border}┐", flush=True)
+    print(f"│ {label:<{width - 1}}│", flush=True)
+    print(f"├{border}┤", flush=True)
+    for line in (text.splitlines() or ["-"]):
+        for i in range(0, max(len(line), 1), width - 3):
+            seg = line[i : i + width - 3]
+            print(f"│ {seg:<{width - 2}}│", flush=True)
+    print(f"└{border}┘", flush=True)
+
+
+def _fmt(data, limit: int = 800) -> str:
+    return json.dumps(data, ensure_ascii=False, default=str, indent=2)[:limit]
+
+
+async def stream_agent(agent, query: str, verbose: int = 0) -> None:
+    """
+    deepagents CompiledStateGraph를 스트리밍으로 실행하고 출력한다.
+
+    verbose 레벨:
+      0 — 기본 (도구 입출력만)
+      1 — 미들웨어 입출력 + tool_calls 결정 내역
+      2 — 모든 LangGraph 체인 이벤트 + LLM 프롬프트 메시지 전체
+    """
     state = {"messages": [{"role": "user", "content": query}]}
 
-    print(f"\n{'=' * 60}")
-    print(f"[Deep Agent] 질의: {query}")
-    print(f"{'=' * 60}\n")
+    print(f"\n{'━' * 64}")
+    print(f"  Deep Agent  질의: {query}")
+    print(f"{'━' * 64}\n")
+
+    tool_step = 0
 
     async for event in agent.astream_events(state, version="v2"):
         kind = event["event"]
+        name = event.get("name", "-")
 
+        # ── verbose=2: 모든 체인 이벤트 ─────────────────────────────
+        if verbose >= 2:
+            if kind == "on_chain_start":
+                data = event["data"].get("input")
+                _box(f"⬇  chain_start  {name}", _fmt(data))
+            elif kind == "on_chain_end":
+                data = event["data"].get("output")
+                _box(f"⬆  chain_end    {name}", _fmt(data))
+            elif kind == "on_retriever_start":
+                q = event["data"].get("input", {}).get("query", "")
+                print(f"\n  [RAG 검색 시작] query={q!r}", flush=True)
+            elif kind == "on_retriever_end":
+                docs = event["data"].get("output", {}).get("documents", [])
+                print(f"  [RAG 검색 완료] {len(docs)}개 청크 반환", flush=True)
+
+        # ── verbose=1: 미들웨어만 ────────────────────────────────────
+        elif verbose >= 1 and "Middleware" in name:
+            if kind == "on_chain_start":
+                _box(f"▶ {name}  [input]", _fmt(event["data"].get("input")))
+            elif kind == "on_chain_end":
+                _box(f"◀ {name}  [output]", _fmt(event["data"].get("output")))
+
+        # ── LLM 프롬프트 (verbose=2) ─────────────────────────────────
+        if verbose >= 2 and kind == "on_chat_model_start":
+            messages = event["data"].get("input", {}).get("messages", [])
+            for turn in messages:
+                role = getattr(turn, "type", "?") if hasattr(turn, "type") else "?"
+                content = str(getattr(turn, "content", turn))[:400]
+                print(f"\n  [LLM 입력 | {role}] {content}", flush=True)
+
+        # ── LLM 스트리밍 출력 ────────────────────────────────────────
         if kind == "on_chat_model_stream":
             chunk = event["data"].get("chunk")
             if chunk and chunk.content:
@@ -178,20 +237,31 @@ async def stream_agent(agent, query: str) -> None:
                 elif isinstance(content, str):
                     print(content, end="", flush=True)
 
+        # ── tool_calls 결정 (verbose>=1) ─────────────────────────────
+        elif kind == "on_chat_model_end" and verbose >= 1:
+            msg = event["data"].get("output")
+            if msg and hasattr(msg, "tool_calls") and msg.tool_calls:
+                _box("  LLM → tool_calls 결정", _fmt(msg.tool_calls))
+
+        # ── 도구 실행 ────────────────────────────────────────────────
         elif kind == "on_tool_start":
-            name = event.get("name", "unknown")
-            data = event["data"].get("input", {})
-            preview = json.dumps(data, ensure_ascii=False)[:120]
-            print(f"\n\n[Tool ▶] {name}")
-            print(f"   입력: {preview}")
+            tool_step += 1
+            args = json.dumps(event["data"].get("input", {}), ensure_ascii=False, indent=2)
+            limit = 600 if verbose >= 1 else 240
+            print(f"\n{'·' * 64}", flush=True)
+            print(f"  Step {tool_step}  {name}", flush=True)
+            print(f"{'·' * 64}", flush=True)
+            print(f"  입력: {args[:limit]}", flush=True)
 
         elif kind == "on_tool_end":
-            output = str(event["data"].get("output", ""))[:120].replace("\n", " ")
-            print(f"[Tool ◀] {output}...")
+            limit = 600 if verbose >= 1 else 200
+            output = str(event["data"].get("output", ""))[:limit].replace("\n", " ")
+            print(f"  결과: {output}", flush=True)
+            print(f"{'·' * 64}", flush=True)
 
-    print(f"\n\n{'=' * 60}")
-    print("[Deep Agent] 완료")
-    print(f"{'=' * 60}\n")
+    print(f"\n{'━' * 64}")
+    print(f"  Deep Agent  완료  (도구 {tool_step}회 실행)")
+    print(f"{'━' * 64}\n")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -234,11 +304,15 @@ async def build_agent(file_paths: list[str] | None = None):
         timeout=120,      # 느린 연결 대비
     )
 
+    backend = FilesystemBackend(root_dir=_APP_DIR)
+
     return create_deep_agent(
         model=model,
         tools=all_tools,
         system_prompt=SYSTEM_PROMPT,
         subagents=subagents_list,
+        backend=backend,
+        skills=["/skills/"],
     )
 
 
@@ -320,7 +394,7 @@ async def main() -> None:
     require_api_keys()
 
     # query, file_paths = parse_args(sys.argv[1:])
-    query, file_paths = "내용을 요약해서 파일로 저장해줘", ["/Users/sso/Downloads/workspace/files/aidoc_인수인계문서.docx"]
+    query, file_paths = "먼저 파일별로 요약을 해주고, 통합적으로 비교 및 분석을 해줘. 그리고 이 내용을 바탕으로 보고서 형태의 docx 파일로 저장해줘.", ["/Users/sso/Downloads/workspace/files/aidoc_인수인계문서.docx", "/Users/sso/Downloads/workspace/수강신청_장바구니_메뉴얼.pdf"]
     agent = await build_agent(file_paths)
     # 파일 경로가 있으면 쿼리에 포함시켜 에이전트가 파일을 인식하도록 함
     effective_query = query
@@ -328,7 +402,7 @@ async def main() -> None:
         paths_str = "\n".join(f"  - {p}" for p in file_paths)
         effective_query = f"{query}\n\n[첨부 파일]\n{paths_str}"
 
-    await stream_agent(agent, effective_query)
+    await stream_agent(agent, effective_query, verbose=2)
 
 
 # ── invoke 방식 (비스트리밍 / 프로그래매틱 호출용) ─────────────────
