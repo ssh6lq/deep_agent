@@ -28,8 +28,11 @@ load_dotenv(_APP_DIR / ".env")
 
 from langchain.chat_models import init_chat_model
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from langgraph.store.memory import InMemoryStore
+from langgraph.store.postgres import AsyncPostgresStore
+
 from deepagents import create_deep_agent
-from deepagents.backends.filesystem import FilesystemBackend
+from deepagents.backends import CompositeBackend, StateBackend, StoreBackend
 
 # ── 내부 모듈 ──────────────────────────────────────────────────────
 from tools import custom_tools
@@ -107,6 +110,16 @@ SYSTEM_PROMPT = """당신은 복잡한 멀티스텝 태스크를 수행하는 De
   research-agent  → 웹 조사
   document-agent  → 내부 문서 분석 (MCP 활용)
   code-agent      → 데이터 처리 / 코드 실행
+
+## 세션 오프로드
+
+| 상황                          | 사용 도구          |
+|-------------------------------|--------------------|
+| 긴 중간 결과를 컨텍스트 밖으로 저장 | save_turn_result |
+
+- thread_id: 현재 세션 식별자 (없으면 "default" 사용)
+- turn_num: 현재 턴 번호 (1부터 순서대로)
+- 저장 후 파일 경로를 메모해 두고 이후 턴에서 참조 가능
 
 ## 금지 사항
 - 확인되지 않은 정보를 사실로 단정하지 말 것
@@ -268,7 +281,7 @@ async def stream_agent(agent, query: str, verbose: int = 0) -> None:
 #  에이전트 빌더
 # ══════════════════════════════════════════════════════════════════
 
-async def build_agent(file_paths: list[str] | None = None):
+async def build_agent(file_paths: list[str] | None = None, store: AsyncPostgresStore | None = None):
     """도구·서브에이전트·모델을 조합해 deepagents 에이전트를 생성한다."""
     mcp_tools = await get_mcp_tools()
     rag_tools = build_rag_tools(file_paths or [])
@@ -304,15 +317,23 @@ async def build_agent(file_paths: list[str] | None = None):
         timeout=120,      # 느린 연결 대비
     )
 
-    backend = FilesystemBackend(root_dir=_APP_DIR)
+    composite = lambda rt: CompositeBackend(
+        default=StateBackend(rt),
+        routes={
+            "/skills/":   StoreBackend(rt),
+            "/memories/": StoreBackend(rt),
+        },
+    )
 
     return create_deep_agent(
         model=model,
         tools=all_tools,
         system_prompt=SYSTEM_PROMPT,
         subagents=subagents_list,
-        backend=backend,
+        backend=composite,
+        store=store,
         skills=["/skills/"],
+        memory=["/memories/AGENTS.md"],
     )
 
 
@@ -393,10 +414,22 @@ def parse_args(argv: list[str]) -> tuple[str, list[str]]:
 async def main() -> None:
     require_api_keys()
 
+    db_url = os.environ.get("DATABASE_URL", "").strip()
+    if db_url:
+        async with AsyncPostgresStore.from_conn_string(db_url) as store:
+            await store.setup()
+            await _run_main(store)
+    else:
+        print("[Store] DATABASE_URL 미설정 — InMemoryStore 사용 (세션 종료 시 데이터 소멸)", flush=True)
+        await _run_main(InMemoryStore())
+
+
+async def _run_main(store) -> None:
     # query, file_paths = parse_args(sys.argv[1:])
+    # query, file_paths ="GPT-5에 대해 검색해줘",[]
     query, file_paths = "먼저 파일별로 요약을 해주고, 통합적으로 비교 및 분석을 해줘. 그리고 이 내용을 바탕으로 보고서 형태의 docx 파일로 저장해줘.", ["/Users/sso/Downloads/workspace/files/aidoc_인수인계문서.docx", "/Users/sso/Downloads/workspace/수강신청_장바구니_메뉴얼.pdf"]
-    agent = await build_agent(file_paths)
-    # 파일 경로가 있으면 쿼리에 포함시켜 에이전트가 파일을 인식하도록 함
+    agent = await build_agent(file_paths, store=store)
+
     effective_query = query
     if file_paths:
         paths_str = "\n".join(f"  - {p}" for p in file_paths)
@@ -411,10 +444,19 @@ async def invoke_agent(query: str, file_paths: list[str] | None = None) -> str:
     """에이전트를 비스트리밍으로 실행하고 최종 답변 문자열을 반환한다."""
     require_api_keys()
 
-    agent = await build_agent(file_paths)
-    result = await agent.ainvoke(
-        {"messages": [{"role": "user", "content": query}]}
-    )
+    db_url = os.environ.get("DATABASE_URL", "").strip()
+    if db_url:
+        async with AsyncPostgresStore.from_conn_string(db_url) as store:
+            await store.setup()
+            agent = await build_agent(file_paths, store=store)
+            result = await agent.ainvoke(
+                {"messages": [{"role": "user", "content": query}]}
+            )
+    else:
+        agent = await build_agent(file_paths, store=InMemoryStore())
+        result = await agent.ainvoke(
+            {"messages": [{"role": "user", "content": query}]}
+        )
     return result["messages"][-1].content
 
 

@@ -14,6 +14,7 @@ Tools
 
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
@@ -215,6 +216,32 @@ def memory_clear() -> str:
 
 
 # ══════════════════════════════════════════════════════════════════
+#  세션 오프로드 도구
+# ══════════════════════════════════════════════════════════════════
+
+_SESSIONS_DIR = Path(__file__).resolve().parent / "sessions"
+
+
+@tool
+def save_turn_result(thread_id: str, turn_num: int, content: str) -> str:
+    """
+    현재 턴의 중요 결과를 세션 폴더에 마크다운 파일로 오프로드한다.
+    컨텍스트 창 절약이 필요한 긴 중간 결과물을 저장할 때 사용.
+
+    Args:
+        thread_id: 세션(스레드) 식별자
+        turn_num:  저장할 턴 번호
+        content:   저장할 내용 (마크다운 형식 권장)
+    """
+    session_dir = _SESSIONS_DIR / thread_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    file_path = session_dir / f"turn_{turn_num}_result.md"
+    file_path.write_text(content, encoding="utf-8")
+    return f"[저장 완료] {file_path}"
+
+
+# ══════════════════════════════════════════════════════════════════
 #  전체 사용자 정의 도구 목록
 # ══════════════════════════════════════════════════════════════════
 
@@ -227,4 +254,5 @@ custom_tools = [
     memory_delete,
     memory_search,
     memory_clear,
+    save_turn_result,
 ]
