@@ -14,7 +14,7 @@ LangChain Deep Agent — deepagents SDK 기반 v9
 
 모델: openai:gpt-4o (OpenAI)
 """
-
+from langchain.agents.middleware import PIIMiddleware
 import asyncio
 import json
 import os
@@ -38,8 +38,7 @@ from langgraph.store.postgres import AsyncPostgresStore
 from deepagents import create_deep_agent
 from deepagents.backends import CompositeBackend, StateBackend
 from deepagents.backends.filesystem import FilesystemBackend
-from langchain.agents.middleware import AgentMiddleware
-from langchain.agents.middleware.types import ModelRequest, ModelResponse
+
 
 # ── 내부 모듈 ──────────────────────────────────────────────────────
 from tools import custom_tools, _current_user_id
@@ -53,6 +52,39 @@ from document_loader import load_document, image_to_vision_content
 #  PII Middleware
 # ══════════════════════════════════════════════════════════════════
 
+class LoggingPIIMiddleware(PIIMiddleware):
+    """PIIMiddleware를 래핑해 마스킹된 내용을 콘솔에 출력한다."""
+
+    def _log_masked(self, orig_messages: list, new_messages: list) -> None:
+        for i, (orig, new) in enumerate(zip(orig_messages, new_messages)):
+            orig_content = str(getattr(orig, "content", ""))
+            new_content = str(getattr(new, "content", ""))
+            if orig_content != new_content:
+                msg_type = type(orig).__name__
+                print("=" * 60)
+                print(f"  [PIIMiddleware] pii_type={self.pii_type!r}  [{msg_type}] msg[{i}] 마스킹 적용")
+                print("-" * 60)
+                print(f"  [BEFORE] {orig_content[:300]}")
+                print(f"  [AFTER ] {new_content[:300]}")
+                print("=" * 60)
+
+    def before_model(self, state, runtime):
+        messages = state.get("messages", [])
+        last_human = next(
+            (m for m in reversed(messages) if hasattr(m, "type") and m.type == "human"),
+            None,
+        )
+        print(f"  [PIIMiddleware][{self.pii_type}] before_model 호출됨 | 마지막 human 메시지: {str(getattr(last_human, 'content', '(없음)'))[:80]!r}")
+        result = super().before_model(state, runtime)
+        print(f"  [PIIMiddleware][{self.pii_type}] 감지 결과: {'마스킹 적용' if result else 'PII 없음'}")
+        if result and "messages" in result:
+            self._log_masked(state["messages"], result["messages"])
+        return result
+
+    async def abefore_model(self, state, runtime):
+        return self.before_model(state, runtime)
+
+
 def _detect_banned_words(content: str) -> list[dict]:
     banned = ["비밀번호", "주민번호", "계좌번호"]
     matches = []
@@ -62,120 +94,120 @@ def _detect_banned_words(content: str) -> list[dict]:
     return matches
 
 
-_PII_RULES: list[dict] = [
-    {
-        "name": "api_key",
-        "detector": r"sk-[a-zA-Z0-9]{32,}",
-        "strategy": "block",
-    },
-    {
-        "name": "banned_word",
-        "detector": _detect_banned_words,
-        "strategy": "redact",
-    },
-]
+# _PII_RULES: list[dict] = [
+#     {
+#         "name": "api_key",
+#         "detector": r"sk-[a-zA-Z0-9]{32,}",
+#         "strategy": "block",
+#     },
+#     {
+#         "name": "banned_word",
+#         "detector": _detect_banned_words,
+#         "strategy": "redact",
+#     },
+# ]
 
 
-class PIIMiddleware(AgentMiddleware):
-    """LLM 호출 전 메시지에서 PII/민감 정보를 탐지해 block 또는 redact한다."""
+# class PIIMiddleware(AgentMiddleware):
+#     """LLM 호출 전 메시지에서 PII/민감 정보를 탐지해 block 또는 redact한다."""
 
-    def _apply_rules(self, text: str) -> tuple[str, list[str], list[dict]]:
-        """규칙을 적용해 (처리된 텍스트, block된 규칙명 목록, redact 로그 목록) 반환."""
-        blocked: list[str] = []
-        redact_log: list[dict] = []
-        for rule in _PII_RULES:
-            detector = rule["detector"]
-            strategy = rule["strategy"]
-            name = rule["name"]
+#     def _apply_rules(self, text: str) -> tuple[str, list[str], list[dict]]:
+#         """규칙을 적용해 (처리된 텍스트, block된 규칙명 목록, redact 로그 목록) 반환."""
+#         blocked: list[str] = []
+#         redact_log: list[dict] = []
+#         for rule in _PII_RULES:
+#             detector = rule["detector"]
+#             strategy = rule["strategy"]
+#             name = rule["name"]
 
-            if isinstance(detector, str):
-                matches = [
-                    {"text": m.group(0), "start": m.start(), "end": m.end()}
-                    for m in re.finditer(detector, text)
-                ]
-            else:
-                matches = detector(text)
+#             if isinstance(detector, str):
+#                 matches = [
+#                     {"text": m.group(0), "start": m.start(), "end": m.end()}
+#                     for m in re.finditer(detector, text)
+#                 ]
+#             else:
+#                 matches = detector(text)
 
-            if not matches:
-                continue
+#             if not matches:
+#                 continue
 
-            if strategy == "block":
-                blocked.append(name)
-                for m in matches:
-                    # API 키 등 민감값은 앞 4자만 노출
-                    preview = m["text"][:4] + "..." if len(m["text"]) > 4 else m["text"]
-                    print(f"  [PIIMiddleware] block 규칙={name!r}  감지={preview!r}  위치={m['start']}-{m['end']}")
-            elif strategy == "redact":
-                for m in sorted(matches, key=lambda x: x["start"], reverse=True):
-                    preview = m["text"][:4] + "..." if len(m["text"]) > 4 else m["text"]
-                    redact_log.append({"rule": name, "preview": preview})
-                    text = text[: m["start"]] + "[REDACTED]" + text[m["end"]:]
+#             if strategy == "block":
+#                 blocked.append(name)
+#                 for m in matches:
+#                     # API 키 등 민감값은 앞 4자만 노출
+#                     preview = m["text"][:4] + "..." if len(m["text"]) > 4 else m["text"]
+#                     print(f"  [PIIMiddleware] block 규칙={name!r}  감지={preview!r}  위치={m['start']}-{m['end']}")
+#             elif strategy == "redact":
+#                 for m in sorted(matches, key=lambda x: x["start"], reverse=True):
+#                     preview = m["text"][:4] + "..." if len(m["text"]) > 4 else m["text"]
+#                     redact_log.append({"rule": name, "preview": preview})
+#                     text = text[: m["start"]] + "[REDACTED]" + text[m["end"]:]
 
-        return text, blocked, redact_log
+#         return text, blocked, redact_log
 
-    def _process_content(self, content):
-        """
-        content가 문자열이면 그대로 규칙 적용.
-        content가 리스트(multimodal)이면 text block만 규칙 적용하고
-        image_url 등 나머지 block은 그대로 유지.
-        반환: (새 content, blocked 목록)
-        """
-        if isinstance(content, str):
-            cleaned, blocked, redact_log = self._apply_rules(content)
-            return cleaned, blocked, redact_log
+    # def _process_content(self, content):
+    #     """
+    #     content가 문자열이면 그대로 규칙 적용.
+    #     content가 리스트(multimodal)이면 text block만 규칙 적용하고
+    #     image_url 등 나머지 block은 그대로 유지.
+    #     반환: (새 content, blocked 목록)
+    #     """
+    #     if isinstance(content, str):
+    #         cleaned, blocked, redact_log = self._apply_rules(content)
+    #         return cleaned, blocked, redact_log
 
-        if isinstance(content, list):
-            all_blocked: list[str] = []
-            all_redact_log: list[dict] = []
-            new_blocks = []
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    cleaned, blocked, redact_log = self._apply_rules(block["text"])
-                    all_blocked.extend(blocked)
-                    all_redact_log.extend(redact_log)
-                    new_blocks.append({**block, "text": cleaned})
-                else:
-                    new_blocks.append(block)
-            return new_blocks, all_blocked, all_redact_log
+    #     if isinstance(content, list):
+    #         all_blocked: list[str] = []
+    #         all_redact_log: list[dict] = []
+    #         new_blocks = []
+    #         for block in content:
+    #             if isinstance(block, dict) and block.get("type") == "text":
+    #                 cleaned, blocked, redact_log = self._apply_rules(block["text"])
+    #                 all_blocked.extend(blocked)
+    #                 all_redact_log.extend(redact_log)
+    #                 new_blocks.append({**block, "text": cleaned})
+    #             else:
+    #                 new_blocks.append(block)
+    #         return new_blocks, all_blocked, all_redact_log
 
-        return content, [], []
+    #     return content, [], []
 
-    def _process_request(self, request: ModelRequest) -> ModelRequest:
-        processed_messages = []
-        for msg in request.messages:
-            content = getattr(msg, "content", "")
-            new_content, blocked, redact_log = self._process_content(content)
+    # def _process_request(self, request: ModelRequest) -> ModelRequest:
+    #     processed_messages = []
+    #     for msg in request.messages:
+    #         content = getattr(msg, "content", "")
+    #         new_content, blocked, redact_log = self._process_content(content)
 
-            if blocked:
-                raise ValueError(
-                    f"[PIIMiddleware] 민감 정보 감지로 요청 차단: {', '.join(blocked)}"
-                )
+    #         if blocked:
+    #             raise ValueError(
+    #                 f"[PIIMiddleware] 민감 정보 감지로 요청 차단: {', '.join(blocked)}"
+    #             )
 
-            if redact_log:
-                for entry in redact_log:
-                    print(f"  [PIIMiddleware] redact 규칙={entry['rule']!r}  감지={entry['preview']!r}  → [REDACTED]")
-            if new_content != content:
-                msg = msg.model_copy(update={"content": new_content})
+    #         if redact_log:
+    #             for entry in redact_log:
+    #                 print(f"  [PIIMiddleware] redact 규칙={entry['rule']!r}  감지={entry['preview']!r}  → [REDACTED]")
+    #         if new_content != content:
+    #             msg = msg.model_copy(update={"content": new_content})
 
-            processed_messages.append(msg)
+    #         processed_messages.append(msg)
 
-        return ModelRequest(
-            model=request.model,
-            messages=processed_messages,
-            system_message=request.system_message,
-            tool_choice=request.tool_choice,
-            tools=request.tools,
-            response_format=request.response_format,
-            state=request.state,
-            runtime=request.runtime,
-            model_settings=request.model_settings,
-        )
+    #     return ModelRequest(
+    #         model=request.model,
+    #         messages=processed_messages,
+    #         system_message=request.system_message,
+    #         tool_choice=request.tool_choice,
+    #         tools=request.tools,
+    #         response_format=request.response_format,
+    #         state=request.state,
+    #         runtime=request.runtime,
+    #         model_settings=request.model_settings,
+    #     )
 
-    async def awrap_model_call(self, request: ModelRequest, handler):
-        return await handler(self._process_request(request))
+    # async def awrap_model_call(self, request: ModelRequest, handler):
+    #     return await handler(self._process_request(request))
 
-    def wrap_model_call(self, request: ModelRequest, handler):
-        return handler(self._process_request(request))
+    # def wrap_model_call(self, request: ModelRequest, handler):
+    #     return handler(self._process_request(request))
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -943,7 +975,11 @@ async def build_agent(
         tools=all_tools,
         system_prompt=SYSTEM_PROMPT,
         subagents=subagents_list,
-        middleware=[PIIMiddleware()],
+        middleware=[
+            LoggingPIIMiddleware("email",       strategy="mask", apply_to_input=True, apply_to_tool_results=True),
+            LoggingPIIMiddleware("credit_card", strategy="mask", apply_to_input=True, apply_to_tool_results=True),
+            LoggingPIIMiddleware("ip",          strategy="mask", apply_to_input=True, apply_to_tool_results=True),
+        ],
         backend=backend,
         store=store,
         skills=["/skills/", "/user-skills/"],   # 전역 + 개인 스킬
@@ -1131,76 +1167,76 @@ async def _run_main(store, user_id: str = "default") -> None:
         #         ]
         #     },
         # },
-        # {
-        #     "role": "user",
-        #     "content": "내용 요약",
-        #     "metadata": {
-        #         "files": [
-        #             {"filepath": "/Users/sso/Downloads/workspace/근로 계약서 양식.docx",
-        #              "filename": "근로 계약서 양식.docx"},
-        #         ]
-        #     },
-        # },
         {
             "role": "user",
-            "content": "첨부한 문서들을 분석해서 보고서로 만들어줘",
-            "metadata": {
-                "files": [
-                    {"filepath": "/Users/sso/Downloads/workspace/수강신청_장바구니_메뉴얼.pdf",
-                     "filename": "수강신청_장바구니_메뉴얼.pdf"},
-                    {"filepath": "/Users/sso/Downloads/workspace/files/2023학년도 개척리더 해외연수 공고문_최종.pdf",
-                     "filename": "2023학년도 개척리더 해외연수 공고문_최종.pdf"},
-                ]
-            },
-        },
-        {
-            "role": "assistant",
-            "content": "1) 작성자 상세 정보 화면 \n- 작성자의 프로필 및 상세 정보를 확인하는 화면 "\
-                "- 구성: 뒤로가기 버튼 / 작성자 정보 / 작성자 문서 목록  - 작성자 정보: 사진, 이름, 부서, 직급, 연락처, 이메일, 열람수, 좋아요 등 "\
-                "- 문서 목록: 작성자가 만든/수정한 문서들을 최신순으로 표시  - 정렬 방식 변경 가능 (열람순, 인기순)  - 문서별 미리보기, 이름, 저장 경로 등 확인 가능 ."\
-                "2) 문서 상세 정보 화면 - 문서 클릭 또는 메뉴에서 ‘세부 정보’ 선택 시 진입  - 구성: 뒤로가기 버튼 / 문서 정보 / 문서 내용  "\
-                "- 문서 정보: 미리보기, 이름, 카테고리, 해시태그 등  - 상세 메타데이터: 생성일, 수정일, 용량, 작성자, 수정자  - 작성자 클릭 시 작성자 상세 화면으로 이동 "\
-                "- 열람수·좋아요로 문서 인기도 확인, 좋아요 기능 제공  - 공유 링크로 내부 사용자에게 문서 공유 가능  - 문서 전체 내용을 텍스트로 확인 가능"
-        },
-        {
-            "role": "user",
-            "content": "이 내용을 번역해서 보고서로 만들어줘"
-        },
-        {
-            "role": "assistant",
-            "content": "보고서를 파일로 저장했어.  \n경로: /worksp ││ ace/document_translation_summary_20260402_043025.md "
-        },
-        {
-            "role": "user",
-            "content": "오늘 대한민국의 날씨는 어때?"
-            
-        },
-        {
-            "role": "assistant",
-            "content": " 오늘(4월 2일) 기준으로 보면 한국은 전반적으로 **봄 날씨**야.  - 아침: 약 4~8도 → 쌀쌀함 │ - 낮: 약 15~20도 → 포근함  - 하늘: 대체로 맑거나 구름 조금"
-        },
-        {
-            "role": "user",
-            "content": "첨부한 문서들을 각각 분석하고, 배포용 보고서 양식으로 만들어줘",
+            "content": "무슨 내용이야?",
             "metadata": {
                 "files": [
                     {"filepath": "/Users/sso/Downloads/workspace/근로 계약서 양식.docx",
                      "filename": "근로 계약서 양식.docx"},
-                    {"filepath": "/Users/sso/Downloads/workspace/수강신청_장바구니_메뉴얼.pdf",
-                     "filename": "수강신청_장바구니_메뉴얼.pdf"},
                 ]
             },
         },
-        {
-            "role": "assistant",
-            "content": "비플식권_매뉴얼 사용자용 2023_에 대한 내용입니다.~~"\
-                "다음은 점심식대 지원제도 안내에 대한 내용입니다.~~"
-        },
-        {
-            "role": "user",
-            "content": "langchain에서 개발한 deep agent에 대해 조사해줘. middleware,skills,sandbox 등의 기능에 대해서 세세하게 조사하고, create_agent와의 차이점을 비교해줘. 이 모든 내용을 기반으로 docx 보고서로 만들어줘"
+        # {
+        #     "role": "user",
+        #     "content": "첨부한 문서들을 분석해서 보고서로 만들어줘",
+        #     "metadata": {
+        #         "files": [
+        #             {"filepath": "/Users/sso/Downloads/workspace/수강신청_장바구니_메뉴얼.pdf",
+        #              "filename": "수강신청_장바구니_메뉴얼.pdf"},
+        #             {"filepath": "/Users/sso/Downloads/workspace/files/2023학년도 개척리더 해외연수 공고문_최종.pdf",
+        #              "filename": "2023학년도 개척리더 해외연수 공고문_최종.pdf"},
+        #         ]
+        #     },
+        # },
+        # {
+        #     "role": "assistant",
+        #     "content": "1) 작성자 상세 정보 화면 \n- 작성자의 프로필 및 상세 정보를 확인하는 화면 "\
+        #         "- 구성: 뒤로가기 버튼 / 작성자 정보 / 작성자 문서 목록  - 작성자 정보: 사진, 이름, 부서, 직급, 연락처, 이메일, 열람수, 좋아요 등 "\
+        #         "- 문서 목록: 작성자가 만든/수정한 문서들을 최신순으로 표시  - 정렬 방식 변경 가능 (열람순, 인기순)  - 문서별 미리보기, 이름, 저장 경로 등 확인 가능 ."\
+        #         "2) 문서 상세 정보 화면 - 문서 클릭 또는 메뉴에서 ‘세부 정보’ 선택 시 진입  - 구성: 뒤로가기 버튼 / 문서 정보 / 문서 내용  "\
+        #         "- 문서 정보: 미리보기, 이름, 카테고리, 해시태그 등  - 상세 메타데이터: 생성일, 수정일, 용량, 작성자, 수정자  - 작성자 클릭 시 작성자 상세 화면으로 이동 "\
+        #         "- 열람수·좋아요로 문서 인기도 확인, 좋아요 기능 제공  - 공유 링크로 내부 사용자에게 문서 공유 가능  - 문서 전체 내용을 텍스트로 확인 가능"
+        # },
+        # {
+        #     "role": "user",
+        #     "content": "이 내용을 번역해서 보고서로 만들어줘"
+        # },
+        # {
+        #     "role": "assistant",
+        #     "content": "보고서를 파일로 저장했어.  \n경로: /worksp ││ ace/document_translation_summary_20260402_043025.md "
+        # },
+        # {
+        #     "role": "user",
+        #     "content": "오늘 대한민국의 날씨는 어때?"
             
-        },
+        # },
+        # {
+        #     "role": "assistant",
+        #     "content": " 오늘(4월 2일) 기준으로 보면 한국은 전반적으로 **봄 날씨**야.  - 아침: 약 4~8도 → 쌀쌀함 │ - 낮: 약 15~20도 → 포근함  - 하늘: 대체로 맑거나 구름 조금"
+        # },
+        # {
+        #     "role": "user",
+        #     "content": "첨부한 문서들을 각각 분석하고, 배포용 보고서 양식으로 만들어줘",
+        #     "metadata": {
+        #         "files": [
+        #             {"filepath": "/Users/sso/Downloads/workspace/근로 계약서 양식.docx",
+        #              "filename": "근로 계약서 양식.docx"},
+        #             {"filepath": "/Users/sso/Downloads/workspace/수강신청_장바구니_메뉴얼.pdf",
+        #              "filename": "수강신청_장바구니_메뉴얼.pdf"},
+        #         ]
+        #     },
+        # },
+        # {
+        #     "role": "assistant",
+        #     "content": "비플식권_매뉴얼 사용자용 2023_에 대한 내용입니다.~~"\
+        #         "다음은 점심식대 지원제도 안내에 대한 내용입니다.~~"
+        # },
+        # {
+        #     "role": "user",
+        #     "content": "langchain에서 개발한 deep agent에 대해 조사해줘. middleware,skills,sandbox 등의 기능에 대해서 세세하게 조사하고, create_agent와의 차이점을 비교해줘. 이 모든 내용을 기반으로 docx 보고서로 만들어줘"
+            
+        # },
         # {
         #     "role": "user",
         #     "content": "처음에 첨부햇던 파일에 대한 정보 좀 알려줘"
